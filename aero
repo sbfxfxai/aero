@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: AERO1473 
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+
+/**
+ * @title AeroCoin
+ * @dev ERC20 token with burning, pausing, and permit functionalities, owned by Ownable contract.
+ */
+contract AeroCoin is ERC20, ERC20Burnable, ERC20Pausable, Ownable, ERC20Permit {
+    using SafeMathUpgradeable for uint256;
+
+    // Reentrancy guard counter
+    uint256 private _guardCounter;
+
+    // Circuit breaker flag
+    bool private _paused;
+
+    // Deposit deadline and withdrawal parameters
+    uint256 public depositDeadline = 1000000000000000000000000000000000000000000 minutes;
+    uint256 public maxWithdrawPerTx = 100000000000000000000000000000000000000000; // Adjust the value as needed
+    uint256 public constant ethToAeroRatio = 1;
+    uint256 public constant DEVELOPER_REWARD_PERCENTAGE = 2;
+
+    // Staking and developer rewards
+    address public developerAddress;
+    uint256 public developerRewardsPool; // Track developer rewards pool
+
+    // Events
+    event EthDeposited(address indexed sender, uint256 amount, uint256 fee);
+    event AeroWithdrawn(address indexed recipient, uint256 amount);
+    event EmergencyStop(bool stopped);
+    event DepositStarted(address indexed sender);
+    event DepositEnded(address indexed sender, uint256 amount);
+    event WithdrawalStarted(address indexed sender, uint256 amount);
+    event WithdrawalEnded(address indexed sender, uint256 amount);
+    event DeveloperRewardClaimed(address indexed developer, uint256 amount);
+    event Minted(address indexed to, uint256 amount);
+    event EthRescued(uint256 amount);
+
+    // Modifiers
+    modifier nonReentrant() {
+        _guardCounter++;
+        uint256 localCounter = _guardCounter;
+        _;
+        require(localCounter == _guardCounter, "Reentrancy detected");
+    }
+
+    modifier notPaused() {
+        require(!_paused, "Contract is paused");
+        _;
+    }
+
+    modifier notContract() {
+        require(!_isContract(msg.sender), "No contracts allowed");
+        _;
+    }
+
+    modifier onlyOwnerCanWithdraw() {
+        require(msg.sender == owner(), "Only owner can withdraw staking and developer rewards");
+        _;
+    }
+
+    // Owner's address
+    address private _owner;
+
+    /**
+     * @dev Constructor to initialize the AeroCoin contract.
+     * @param _developerAddress The address to receive developer rewards.
+     */
+    constructor(address _developerAddress) ERC20("AeroCoin", "ARO") Ownable(msg.sender) ERC20Permit("AeroCoin") {
+        _owner = msg.sender;
+        developerAddress = _developerAddress;
+    }
+
+    // Fallback function to receive AVAX
+    receive() external payable {
+        deposit();
+    }
+
+    function deposit() public payable nonReentrant notContract notPaused {
+        emit DepositStarted(msg.sender);
+
+        // Checks
+        require(msg.value > 0, "Must deposit some AVAX");
+        require(block.timestamp < depositDeadline, "Deposit deadline passed");
+
+        // Calculate Aero tokens to mint based on AVAX
+        uint256 aeroAmount = msg.value.mul(ethToAeroRatio);
+
+        // Calculate developer fee
+        uint256 developerFee = msg.value.mul(DEVELOPER_REWARD_PERCENTAGE).div(100);
+
+        // Mint Aero tokens to the sender
+        _mint(msg.sender, aeroAmount);
+
+        // Add developer fee to the rewards pool
+        developerRewardsPool = developerRewardsPool.add(developerFee);
+
+        // Interactions
+        // Emit events
+        emit EthDeposited(msg.sender, msg.value, developerFee);
+        emit DepositEnded(msg.sender, aeroAmount);
+    }
+
+    function withdraw(uint256 _aeroAmount) external nonReentrant notPaused {
+        emit WithdrawalStarted(msg.sender, _aeroAmount);
+
+        require(_aeroAmount > 0, "Withdraw AeroCoin tokens");
+        require(_aeroAmount <= maxWithdrawPerTx, "Exceeds max per tx");
+        require(balanceOf(msg.sender) >= _aeroAmount, "Insufficient balance");
+
+        // Calculate AVAX amount to transfer
+        uint256 avaxAmount = _aeroAmount.div(ethToAeroRatio);
+
+        // Burn Aero tokens from the sender
+        _burn(msg.sender, _aeroAmount);
+
+        // Transfer AVAX to the sender
+        sendETH(msg.sender, avaxAmount);
+
+        // Emit events
+        emit AeroWithdrawn(msg.sender, _aeroAmount);
+        emit WithdrawalEnded(msg.sender, avaxAmount);
+    }
+
+    /**
+     * @dev Rescue remaining ETH in the contract.
+     */
+    function rescueEth() external onlyOwner {
+        uint256 amount = address(this).balance;
+        require(amount > 0, "No ETH to rescue");
+        (bool success, ) = _owner.call{value: amount, gas: gasleft()}("");
+        require(success, "Eth rescue failed");
+
+        // Emit event
+        emit EthRescued(amount);
+    }
+
+    /**
+     * @dev Claim developer rewards from the pool.
+     */
+    function claimDeveloperReward() public onlyOwner {
+        // Ensure that there are developer rewards available
+        require(developerRewardsPool > 0, "No developer rewards available");
+
+        // Subtract the claimed reward from the rewards pool
+        uint256 developerReward = developerRewardsPool;
+
+        // Reset the developer rewards pool
+        developerRewardsPool = 0;
+
+        // Transfer developer rewards to the developer address
+        sendETH(developerAddress, developerReward);
+
+        // Emit event
+        emit DeveloperRewardClaimed(developerAddress, developerReward);
+    }
+
+    /**
+     * @dev Internal function to check if the given address is a contract.
+     * @param account The address to check.
+     * @return true if the address is a contract, false otherwise.
+     */
+    function _isContract(address account) internal view returns (bool) {
+        uint256 size;
+       assembly {
+    size := extcodesize(account)
+}
+
+        return size > 0;
+    }
+
+    // Internal function to send ETH to an address.
+    function sendETH(address recipient, uint256 amount) internal {
+        require(amount > 0, "Amount must be greater than zero");
+        (bool success, ) = payable(recipient).call{value: amount, gas: gasleft()}("");
+        require(success, "Eth transfer failed");
+    }
+
+    // Override _update function to integrate with ERC20Pausable
+    function _update(address from, address to, uint256 value) internal override(ERC20, ERC20Pausable) {
+        ERC20Pausable._update(from, to, value);
+    }
+}
